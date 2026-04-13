@@ -1,5 +1,6 @@
 import os
 import sys
+import gc
 import argparse
 import time
 from pathlib import Path
@@ -14,6 +15,7 @@ sys.path.append(parent_dir)
 from pipeline.stream_diffvsr_pipeline import StreamDiffVSRPipeline, ControlNetModel, UNet2DConditionModel
 from diffusers import DDIMScheduler
 from temporal_autoencoder.autoencoder_tiny import TemporalAutoencoderTiny
+from transformers import CLIPTextModel, CLIPTokenizer
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -44,7 +46,7 @@ def main():
         print(f"  {arg}: {value}")
 
     set_seed(42)
-    device = torch.device('cuda')
+    device = torch.device('cuda:0')
 
     controlnet = load_component(ControlNetModel, args.controlnet_pretrained_weight, args.model_id, "controlnet")
     unet = load_component(UNet2DConditionModel, args.unet_pretrained_weight, args.model_id, "unet")
@@ -52,17 +54,22 @@ def main():
     scheduler = DDIMScheduler.from_pretrained(args.model_id, subfolder="scheduler")
 
     tensorrt_kwargs = {
-        "custom_pipeline": "/acceleration/tensorrt/sd_with_controlnet_ST",
+        "custom_pipeline": "acceleration/tensorrt/sd_with_controlnet_ST",
         "image_height": args.image_height,
         "image_width": args.image_width,
     } if args.enable_tensorrt else {"custom_pipeline": None}
     
+    text_encoder = CLIPTextModel.from_pretrained(os.path.join(args.model_id, "text_encoder"))
+    tokenizer = CLIPTokenizer.from_pretrained(os.path.join(args.model_id, "tokenizer"))
+
     pipeline = StreamDiffVSRPipeline.from_pretrained(
         args.model_id,
         controlnet=controlnet, 
         vae=vae, 
-        unet=unet, 
+        unet=unet,  
         scheduler=scheduler,
+        text_encoder=text_encoder,   # ← 直接传进去，pipeline 不会再自动加载
+        tokenizer=tokenizer,          # ← 同上
         **tensorrt_kwargs
     )
 
@@ -76,9 +83,18 @@ def main():
     of_model.requires_grad_(False) 
     
     seqs = sorted(os.listdir(args.in_path))
+    VALID_EXTS = {'.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG'}
+
     for seq in seqs:
         seq_path = os.path.join(args.in_path, seq)
-        frame_names = sorted(os.listdir(seq_path))
+        if not os.path.isdir(seq_path):  # 跳过非目录
+            continue
+        frame_names = sorted([
+            f for f in os.listdir(seq_path)
+            if os.path.splitext(f)[1] in VALID_EXTS
+        ])
+        if not frame_names:
+            continue
         frames = []
         for frame_name in frame_names:
             frame_path = os.path.join(seq_path, frame_name)
@@ -98,7 +114,9 @@ def main():
         os.makedirs(target_path, exist_ok=True)
         
         for frame, name in zip(frames_to_save, frame_names):
-            frame.save(os.path.join(target_path, name))
+            # if args.image_height and args.image_width:
+            #     frame = frame.resize((args.image_width, args.image_height), Image.BILINEAR)
+            frame.save(os.path.join(target_path, name.replace('png', 'jpg')))
         
         print(f"Upscaled {seq} and saved to {target_path}.")
         
